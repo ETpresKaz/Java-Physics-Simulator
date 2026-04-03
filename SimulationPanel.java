@@ -3,6 +3,7 @@ import java.awt.Color;
 import java.awt.Font;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
+import java.awt.Point;
 import java.awt.RenderingHints;
 import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
@@ -16,18 +17,26 @@ import javax.swing.Timer;
 
 public class SimulationPanel extends JPanel {
     private static final double GRAVITY = 900.0;
-    private static final double RESTITUTION = 0.88;
-    private static final double WALL_FRICTION = 0.995;
+    private static final double RESTITUTION = 0.84;
+    private static final double WALL_FRICTION = 0.992;
     private static final double AIR_DRAG = 0.999;
     private static final int TARGET_FPS = 60;
-    private static final int INITIAL_BALLS = 18;
+    private static final int INITIAL_BODIES = 14;
 
-    private final List<Ball> balls = new ArrayList<>();
+    private final List<Body> bodies = new ArrayList<>();
     private final Random random = new Random();
+
     private Timer timer;
     private long lastTime;
+
     private boolean paused = false;
     private boolean showHUD = true;
+    private boolean showVelocityVectors = false;
+    private boolean showAccelerationVectors = false;
+    private boolean showAABBs = false;
+
+    private SpawnMode currentSpawnMode = SpawnMode.CIRCLE;
+    private Body selectedBody = null;
 
     public SimulationPanel() {
         setBackground(Color.BLACK);
@@ -39,18 +48,34 @@ public class SimulationPanel extends JPanel {
                 switch (e.getKeyCode()) {
                     case KeyEvent.VK_SPACE -> paused = !paused;
                     case KeyEvent.VK_R -> resetSimulation();
-                    case KeyEvent.VK_C -> balls.clear();
+                    case KeyEvent.VK_C -> {
+                        bodies.clear();
+                        selectedBody = null;
+                    }
                     case KeyEvent.VK_H -> showHUD = !showHUD;
-                    case KeyEvent.VK_B -> spawnBall(getWidth() / 2.0, 80.0);
+                    case KeyEvent.VK_V -> showVelocityVectors = !showVelocityVectors;
+                    case KeyEvent.VK_A -> showAccelerationVectors = !showAccelerationVectors;
+                    case KeyEvent.VK_X -> showAABBs = !showAABBs;
+                    case KeyEvent.VK_1 -> currentSpawnMode = SpawnMode.CIRCLE;
+                    case KeyEvent.VK_2 -> currentSpawnMode = SpawnMode.BOX;
+                    case KeyEvent.VK_B -> spawnBody(getWidth() / 2.0, 90.0, currentSpawnMode);
                 }
+                repaint();
             }
         });
 
         addMouseListener(new MouseAdapter() {
             @Override
             public void mousePressed(MouseEvent e) {
-                spawnBall(e.getX(), e.getY());
                 requestFocusInWindow();
+
+                if (paused) {
+                    selectedBody = findBodyAt(e.getPoint());
+                } else {
+                    spawnBody(e.getX(), e.getY(), currentSpawnMode);
+                }
+
+                repaint();
             }
         });
     }
@@ -77,84 +102,106 @@ public class SimulationPanel extends JPanel {
     }
 
     private void resetSimulation() {
-        balls.clear();
+        bodies.clear();
+        selectedBody = null;
 
         int width = Math.max(getWidth(), 1000);
         int height = Math.max(getHeight(), 700);
 
-        for (int i = 0; i < INITIAL_BALLS; i++) {
-            double radius = 12 + random.nextDouble() * 18;
-            double x = 80 + random.nextDouble() * Math.max(1, width - 160);
-            double y = 40 + random.nextDouble() * Math.max(1, height / 2.0 - 60);
-            double vx = -180 + random.nextDouble() * 360;
-            double vy = -50 + random.nextDouble() * 120;
-            double mass = radius * radius * 0.08;
-            Color color = new Color(
-                60 + random.nextInt(196),
-                60 + random.nextInt(196),
-                60 + random.nextInt(196)
-            );
-            balls.add(new Ball(x, y, vx, vy, radius, mass, color));
+        for (int i = 0; i < INITIAL_BODIES; i++) {
+            SpawnMode mode = (i % 2 == 0) ? SpawnMode.CIRCLE : SpawnMode.BOX;
+            double x = 100 + random.nextDouble() * Math.max(1, width - 200);
+            double y = 50 + random.nextDouble() * Math.max(1, height / 2.0 - 100);
+            spawnBody(x, y, mode);
         }
     }
 
-    private void spawnBall(double x, double y) {
-        double radius = 10 + random.nextDouble() * 20;
-        double vx = -220 + random.nextDouble() * 440;
-        double vy = -240 - random.nextDouble() * 120;
-        double mass = radius * radius * 0.08;
-        Color color = new Color(
-            100 + random.nextInt(156),
-            100 + random.nextInt(156),
-            100 + random.nextInt(156)
+    private void spawnBody(double x, double y, SpawnMode mode) {
+        Body body = new Body();
+        body.shape = mode;
+        body.x = x;
+        body.y = y;
+        body.vx = -220 + random.nextDouble() * 440;
+        body.vy = -180 - random.nextDouble() * 160;
+        body.ax = 0;
+        body.ay = GRAVITY;
+        body.color = new Color(
+            70 + random.nextInt(160),
+            70 + random.nextInt(160),
+            70 + random.nextInt(160)
         );
-        balls.add(new Ball(x, y, vx, vy, radius, mass, color));
+
+        if (mode == SpawnMode.CIRCLE) {
+            body.radius = 12 + random.nextDouble() * 20;
+            body.width = body.radius * 2.0;
+            body.height = body.radius * 2.0;
+            body.mass = Math.PI * body.radius * body.radius * 0.020;
+        } else {
+            body.width = 24 + random.nextDouble() * 28;
+            body.height = 24 + random.nextDouble() * 28;
+            body.radius = Math.max(body.width, body.height) * 0.5;
+            body.mass = body.width * body.height * 0.016;
+        }
+
+        bodies.add(body);
     }
 
     private void updatePhysics(double dt) {
-        for (Ball ball : balls) {
-            ball.vy += GRAVITY * dt;
-            ball.vx *= AIR_DRAG;
-            ball.vy *= AIR_DRAG;
-            ball.x += ball.vx * dt;
-            ball.y += ball.vy * dt;
-            handleWallCollision(ball);
+        for (Body body : bodies) {
+            body.ax = 0;
+            body.ay = GRAVITY;
+
+            body.vx += body.ax * dt;
+            body.vy += body.ay * dt;
+
+            body.vx *= AIR_DRAG;
+            body.vy *= AIR_DRAG;
+
+            body.x += body.vx * dt;
+            body.y += body.vy * dt;
+
+            handleWallCollision(body);
         }
 
-        for (int i = 0; i < balls.size(); i++) {
-            for (int j = i + 1; j < balls.size(); j++) {
-                resolveBallCollision(balls.get(i), balls.get(j));
+        for (int i = 0; i < bodies.size(); i++) {
+            for (int j = i + 1; j < bodies.size(); j++) {
+                resolveCollision(bodies.get(i), bodies.get(j));
             }
         }
     }
 
-    private void handleWallCollision(Ball ball) {
-        int width = getWidth();
-        int height = getHeight();
-
-        if (ball.x - ball.radius < 0) {
-            ball.x = ball.radius;
-            ball.vx = -ball.vx * RESTITUTION;
-        } else if (ball.x + ball.radius > width) {
-            ball.x = width - ball.radius;
-            ball.vx = -ball.vx * RESTITUTION;
+    private void handleWallCollision(Body body) {
+        if (body.getLeft() < 0) {
+            body.x = body.halfWidth();
+            body.vx = -body.vx * RESTITUTION;
+        } else if (body.getRight() > getWidth()) {
+            body.x = getWidth() - body.halfWidth();
+            body.vx = -body.vx * RESTITUTION;
         }
 
-        if (ball.y - ball.radius < 0) {
-            ball.y = ball.radius;
-            ball.vy = -ball.vy * RESTITUTION;
-        } else if (ball.y + ball.radius > height) {
-            ball.y = height - ball.radius;
-            ball.vy = -ball.vy * RESTITUTION;
-            ball.vx *= WALL_FRICTION;
+        if (body.getTop() < 0) {
+            body.y = body.halfHeight();
+            body.vy = -body.vy * RESTITUTION;
+        } else if (body.getBottom() > getHeight()) {
+            body.y = getHeight() - body.halfHeight();
+            body.vy = -body.vy * RESTITUTION;
+            body.vx *= WALL_FRICTION;
 
-            if (Math.abs(ball.vy) < 10) {
-                ball.vy = 0;
+            if (Math.abs(body.vy) < 12.0) {
+                body.vy = 0.0;
             }
         }
     }
 
-    private void resolveBallCollision(Ball a, Ball b) {
+    private void resolveCollision(Body a, Body b) {
+        if (a.shape == SpawnMode.CIRCLE && b.shape == SpawnMode.CIRCLE) {
+            resolveCircleCircle(a, b);
+        } else {
+            resolveAABBCollision(a, b);
+        }
+    }
+
+    private void resolveCircleCircle(Body a, Body b) {
         double dx = b.x - a.x;
         double dy = b.y - a.y;
         double distanceSquared = dx * dx + dy * dy;
@@ -173,15 +220,52 @@ public class SimulationPanel extends JPanel {
         double distance = Math.sqrt(distanceSquared);
         double nx = dx / distance;
         double ny = dy / distance;
-
         double overlap = minDistance - distance;
+
+        separateBodies(a, b, nx, ny, overlap);
+        applyImpulse(a, b, nx, ny);
+    }
+
+    private void resolveAABBCollision(Body a, Body b) {
+        double overlapX = Math.min(a.getRight(), b.getRight()) - Math.max(a.getLeft(), b.getLeft());
+        double overlapY = Math.min(a.getBottom(), b.getBottom()) - Math.max(a.getTop(), b.getTop());
+
+        if (overlapX <= 0 || overlapY <= 0) {
+            return;
+        }
+
+        double nx;
+        double ny;
+        double overlap;
+
+        if (overlapX < overlapY) {
+            overlap = overlapX;
+            nx = (a.x < b.x) ? 1.0 : -1.0;
+            ny = 0.0;
+        } else {
+            overlap = overlapY;
+            nx = 0.0;
+            ny = (a.y < b.y) ? 1.0 : -1.0;
+        }
+
+        separateBodies(a, b, nx, ny, overlap);
+        applyImpulse(a, b, nx, ny);
+    }
+
+    private void separateBodies(Body a, Body b, double nx, double ny, double overlap) {
         double totalMass = a.mass + b.mass;
+        if (totalMass <= 0) {
+            return;
+        }
 
-        a.x -= nx * overlap * (b.mass / totalMass);
-        a.y -= ny * overlap * (b.mass / totalMass);
-        b.x += nx * overlap * (a.mass / totalMass);
-        b.y += ny * overlap * (a.mass / totalMass);
+        double correction = overlap + 0.01;
+        a.x -= nx * correction * (b.mass / totalMass);
+        a.y -= ny * correction * (b.mass / totalMass);
+        b.x += nx * correction * (a.mass / totalMass);
+        b.y += ny * correction * (a.mass / totalMass);
+    }
 
+    private void applyImpulse(Body a, Body b, double nx, double ny) {
         double rvx = b.vx - a.vx;
         double rvy = b.vy - a.vy;
         double velocityAlongNormal = rvx * nx + rvy * ny;
@@ -190,8 +274,7 @@ public class SimulationPanel extends JPanel {
             return;
         }
 
-        double e = 0.92;
-        double impulseMagnitude = -(1 + e) * velocityAlongNormal;
+        double impulseMagnitude = -(1.0 + RESTITUTION) * velocityAlongNormal;
         impulseMagnitude /= (1.0 / a.mass) + (1.0 / b.mass);
 
         double impulseX = impulseMagnitude * nx;
@@ -207,7 +290,7 @@ public class SimulationPanel extends JPanel {
         double tangentVelocity = rvx * tx + rvy * ty;
         double frictionImpulseMagnitude = -tangentVelocity;
         frictionImpulseMagnitude /= (1.0 / a.mass) + (1.0 / b.mass);
-        frictionImpulseMagnitude *= 0.03;
+        frictionImpulseMagnitude *= 0.06;
 
         double frictionX = frictionImpulseMagnitude * tx;
         double frictionY = frictionImpulseMagnitude * ty;
@@ -218,6 +301,16 @@ public class SimulationPanel extends JPanel {
         b.vy += frictionY / b.mass;
     }
 
+    private Body findBodyAt(Point point) {
+        for (int i = bodies.size() - 1; i >= 0; i--) {
+            Body body = bodies.get(i);
+            if (body.contains(point.x, point.y)) {
+                return body;
+            }
+        }
+        return null;
+    }
+
     @Override
     protected void paintComponent(Graphics g) {
         super.paintComponent(g);
@@ -225,10 +318,15 @@ public class SimulationPanel extends JPanel {
         g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
 
         drawBackground(g2);
-        drawBalls(g2);
+        drawBodies(g2);
+        drawDebugOverlays(g2);
 
         if (showHUD) {
             drawHUD(g2);
+        }
+
+        if (paused && selectedBody != null) {
+            drawSelectedBodyPanel(g2, selectedBody);
         }
     }
 
@@ -249,53 +347,172 @@ public class SimulationPanel extends JPanel {
         g2.drawLine(0, getHeight() - 1, getWidth(), getHeight() - 1);
     }
 
-    private void drawBalls(Graphics2D g2) {
-        for (Ball ball : balls) {
-            int x = (int) Math.round(ball.x - ball.radius);
-            int y = (int) Math.round(ball.y - ball.radius);
-            int diameter = (int) Math.round(ball.radius * 2);
+    private void drawBodies(Graphics2D g2) {
+        for (Body body : bodies) {
+            if (body == selectedBody && paused) {
+                g2.setColor(new Color(255, 255, 255, 40));
+                g2.fillRect((int) Math.round(body.getLeft() - 6), (int) Math.round(body.getTop() - 6), (int) Math.round(body.width + 12), (int) Math.round(body.height + 12));
+            }
 
-            g2.setColor(ball.color);
-            g2.fillOval(x, y, diameter, diameter);
-
-            g2.setColor(new Color(255, 255, 255, 90));
-            g2.fillOval(x + diameter / 5, y + diameter / 5, Math.max(4, diameter / 4), Math.max(4, diameter / 4));
-
-            g2.setColor(Color.BLACK);
-            g2.drawOval(x, y, diameter, diameter);
+            g2.setColor(body.color);
+            if (body.shape == SpawnMode.CIRCLE) {
+                g2.fillOval((int) Math.round(body.getLeft()), (int) Math.round(body.getTop()), (int) Math.round(body.width), (int) Math.round(body.height));
+                g2.setColor(new Color(255, 255, 255, 90));
+                g2.fillOval((int) Math.round(body.getLeft() + body.width * 0.2), (int) Math.round(body.getTop() + body.height * 0.2), Math.max(4, (int) Math.round(body.width * 0.22)), Math.max(4, (int) Math.round(body.height * 0.22)));
+                g2.setColor(Color.BLACK);
+                g2.drawOval((int) Math.round(body.getLeft()), (int) Math.round(body.getTop()), (int) Math.round(body.width), (int) Math.round(body.height));
+            } else {
+                g2.fillRect((int) Math.round(body.getLeft()), (int) Math.round(body.getTop()), (int) Math.round(body.width), (int) Math.round(body.height));
+                g2.setColor(new Color(255, 255, 255, 70));
+                g2.fillRect((int) Math.round(body.getLeft() + 4), (int) Math.round(body.getTop() + 4), Math.max(4, (int) Math.round(body.width * 0.28)), Math.max(4, (int) Math.round(body.height * 0.28)));
+                g2.setColor(Color.BLACK);
+                g2.drawRect((int) Math.round(body.getLeft()), (int) Math.round(body.getTop()), (int) Math.round(body.width), (int) Math.round(body.height));
+            }
         }
+    }
+
+    private void drawDebugOverlays(Graphics2D g2) {
+        for (Body body : bodies) {
+            if (showAABBs) {
+                g2.setColor(new Color(255, 80, 80, 180));
+                g2.drawRect((int) Math.round(body.getLeft()), (int) Math.round(body.getTop()), (int) Math.round(body.width), (int) Math.round(body.height));
+            }
+
+            if (showVelocityVectors) {
+                drawVector(g2, body.x, body.y, body.vx * 0.18, body.vy * 0.18, new Color(80, 220, 255));
+            }
+
+            if (showAccelerationVectors) {
+                drawVector(g2, body.x, body.y, body.ax * 0.05, body.ay * 0.05, new Color(255, 210, 80));
+            }
+        }
+    }
+
+    private void drawVector(Graphics2D g2, double x, double y, double dx, double dy, Color color) {
+        int x1 = (int) Math.round(x);
+        int y1 = (int) Math.round(y);
+        int x2 = (int) Math.round(x + dx);
+        int y2 = (int) Math.round(y + dy);
+
+        g2.setColor(color);
+        g2.setStroke(new BasicStroke(2f));
+        g2.drawLine(x1, y1, x2, y2);
+
+        double angle = Math.atan2(dy, dx);
+        int arrowSize = 8;
+        int ax1 = (int) Math.round(x2 - arrowSize * Math.cos(angle - Math.PI / 6));
+        int ay1 = (int) Math.round(y2 - arrowSize * Math.sin(angle - Math.PI / 6));
+        int ax2 = (int) Math.round(x2 - arrowSize * Math.cos(angle + Math.PI / 6));
+        int ay2 = (int) Math.round(y2 - arrowSize * Math.sin(angle + Math.PI / 6));
+
+        g2.drawLine(x2, y2, ax1, ay1);
+        g2.drawLine(x2, y2, ax2, ay2);
     }
 
     private void drawHUD(Graphics2D g2) {
         g2.setFont(new Font("Monospaced", Font.PLAIN, 14));
         g2.setColor(new Color(0, 0, 0, 150));
-        g2.fillRoundRect(12, 12, 420, 122, 16, 16);
+        g2.fillRoundRect(12, 12, 690, 142, 16, 16);
 
         g2.setColor(Color.WHITE);
-        g2.drawString("2D Physics Simulator", 24, 36);
-        g2.drawString("Balls: " + balls.size(), 24, 58);
-        g2.drawString("Left click = spawn ball", 24, 80);
-        g2.drawString("Space = pause | R = reset | C = clear | B = spawn center | H = hide HUD", 24, 102);
-        g2.drawString("Status: " + (paused ? "PAUSED" : "RUNNING"), 24, 124);
+        g2.drawString("Advanced 2D Physics Simulator", 24, 34);
+        g2.drawString("Bodies: " + bodies.size() + " | Status: " + (paused ? "PAUSED" : "RUNNING") + " | Spawn: " + currentSpawnMode.label, 24, 56);
+        g2.drawString("Running click = spawn selected shape | Paused click = inspect body", 24, 78);
+        g2.drawString("1 = circle | 2 = box | B = spawn center | V = velocity | A = acceleration | X = AABB", 24, 100);
+        g2.drawString("Space = pause | R = reset | C = clear | H = hide HUD", 24, 122);
+        g2.drawString("Selection only works while paused. That part is on purpose, not a bug.", 24, 144);
     }
 
-    private static class Ball {
+    private void drawSelectedBodyPanel(Graphics2D g2, Body body) {
+        double speedSquared = body.vx * body.vx + body.vy * body.vy;
+        double speed = Math.sqrt(speedSquared);
+        double kineticEnergy = 0.5 * body.mass * speedSquared;
+        double potentialEnergy = body.mass * GRAVITY * Math.max(0, getHeight() - body.y);
+        double totalEnergy = kineticEnergy + potentialEnergy;
+
+        int panelWidth = 360;
+        int panelHeight = 248;
+        int x = getWidth() - panelWidth - 16;
+        int y = 16;
+
+        g2.setColor(new Color(0, 0, 0, 185));
+        g2.fillRoundRect(x, y, panelWidth, panelHeight, 18, 18);
+        g2.setColor(Color.WHITE);
+        g2.setFont(new Font("Monospaced", Font.PLAIN, 14));
+
+        int lineY = y + 28;
+        int step = 18;
+        g2.drawString("Selected Body", x + 14, lineY); lineY += step;
+        g2.drawString("Shape: " + body.shape.label, x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Position: (%.2f, %.2f)", body.x, body.y), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Velocity: (%.2f, %.2f)", body.vx, body.vy), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Acceleration: (%.2f, %.2f)", body.ax, body.ay), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Speed: %.2f", speed), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Mass: %.3f", body.mass), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Width: %.2f | Height: %.2f", body.width, body.height), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Radius: %.2f", body.radius), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Kinetic Energy: %.2f", kineticEnergy), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Potential Energy: %.2f", potentialEnergy), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Total Energy: %.2f", totalEnergy), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("AABB: [%.1f, %.1f] to [%.1f, %.1f]", body.getLeft(), body.getTop(), body.getRight(), body.getBottom()), x + 14, lineY);
+    }
+
+    private enum SpawnMode {
+        CIRCLE("Circle"),
+        BOX("Box");
+
+        final String label;
+
+        SpawnMode(String label) {
+            this.label = label;
+        }
+    }
+
+    private static class Body {
+        SpawnMode shape;
         double x;
         double y;
         double vx;
         double vy;
+        double ax;
+        double ay;
+        double width;
+        double height;
         double radius;
         double mass;
         Color color;
 
-        Ball(double x, double y, double vx, double vy, double radius, double mass, Color color) {
-            this.x = x;
-            this.y = y;
-            this.vx = vx;
-            this.vy = vy;
-            this.radius = radius;
-            this.mass = mass;
-            this.color = color;
+        double halfWidth() {
+            return width * 0.5;
+        }
+
+        double halfHeight() {
+            return height * 0.5;
+        }
+
+        double getLeft() {
+            return x - halfWidth();
+        }
+
+        double getRight() {
+            return x + halfWidth();
+        }
+
+        double getTop() {
+            return y - halfHeight();
+        }
+
+        double getBottom() {
+            return y + halfHeight();
+        }
+
+        boolean contains(double px, double py) {
+            if (shape == SpawnMode.CIRCLE) {
+                double dx = px - x;
+                double dy = py - y;
+                return dx * dx + dy * dy <= radius * radius;
+            }
+            return px >= getLeft() && px <= getRight() && py >= getTop() && py <= getBottom();
         }
     }
 }
