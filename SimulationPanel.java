@@ -9,6 +9,8 @@ import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.awt.event.MouseMotionAdapter;
+import java.awt.geom.Path2D;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
@@ -17,17 +19,26 @@ import javax.swing.Timer;
 
 public class SimulationPanel extends JPanel {
     private static final double GRAVITY = 900.0;
-    private static final double RESTITUTION = 0.84;
-    private static final double WALL_FRICTION = 0.992;
-    private static final double AIR_DRAG = 0.999;
+    private static final double LINEAR_DAMPING = 0.999;
+    private static final double ANGULAR_DAMPING = 0.999;
+    private static final double RESTITUTION = 0.18;
+    private static final double FRICTION = 0.55;
+    private static final double WALL_RESTITUTION = 0.16;
+    private static final double POSITION_SLOP = 0.01;
+    private static final double POSITION_PERCENT = 0.85;
     private static final int TARGET_FPS = 60;
+    private static final double FIXED_DT = 1.0 / 120.0;
+    private static final int SUBSTEPS = 2;
+    private static final int SOLVER_ITERATIONS = 8;
     private static final int INITIAL_BODIES = 14;
+    private static final double FORCE_SCALE = 7.0;
 
     private final List<Body> bodies = new ArrayList<>();
     private final Random random = new Random();
 
     private Timer timer;
     private long lastTime;
+    private double accumulator = 0.0;
 
     private boolean paused = false;
     private boolean showHUD = true;
@@ -37,6 +48,14 @@ public class SimulationPanel extends JPanel {
 
     private SpawnMode currentSpawnMode = SpawnMode.CIRCLE;
     private Body selectedBody = null;
+
+    private Body pausedDraggedBody = null;
+    private double pausedDragOffsetX = 0.0;
+    private double pausedDragOffsetY = 0.0;
+
+    private Body forceBody = null;
+    private Point forceStart = null;
+    private Point forceCurrent = null;
 
     public SimulationPanel() {
         setBackground(Color.BLACK);
@@ -51,6 +70,8 @@ public class SimulationPanel extends JPanel {
                     case KeyEvent.VK_C -> {
                         bodies.clear();
                         selectedBody = null;
+                        pausedDraggedBody = null;
+                        clearForceState();
                     }
                     case KeyEvent.VK_H -> showHUD = !showHUD;
                     case KeyEvent.VK_V -> showVelocityVectors = !showVelocityVectors;
@@ -70,11 +91,61 @@ public class SimulationPanel extends JPanel {
                 requestFocusInWindow();
 
                 if (paused) {
-                    selectedBody = findBodyAt(e.getPoint());
+                    Body hit = findBodyAt(e.getPoint());
+                    selectedBody = hit;
+                    pausedDraggedBody = hit;
+                    if (hit != null) {
+                        pausedDragOffsetX = hit.x - e.getX();
+                        pausedDragOffsetY = hit.y - e.getY();
+                        hit.vx = 0.0;
+                        hit.vy = 0.0;
+                        hit.angularVelocity = 0.0;
+                    }
                 } else {
-                    spawnBody(e.getX(), e.getY(), currentSpawnMode);
+                    Body hit = findBodyAt(e.getPoint());
+                    if (hit != null) {
+                        forceBody = hit;
+                        forceStart = e.getPoint();
+                        forceCurrent = e.getPoint();
+                    } else {
+                        spawnBody(e.getX(), e.getY(), currentSpawnMode);
+                    }
                 }
 
+                repaint();
+            }
+
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                if (paused) {
+                    pausedDraggedBody = null;
+                } else {
+                    if (forceBody != null && forceStart != null) {
+                        applyDragForce(forceBody, forceStart, e.getPoint());
+                    }
+                    clearForceState();
+                }
+                repaint();
+            }
+        });
+
+        addMouseMotionListener(new MouseMotionAdapter() {
+            @Override
+            public void mouseDragged(MouseEvent e) {
+                if (paused) {
+                    if (pausedDraggedBody != null) {
+                        pausedDraggedBody.x = e.getX() + pausedDragOffsetX;
+                        pausedDraggedBody.y = e.getY() + pausedDragOffsetY;
+                        pausedDraggedBody.vx = 0.0;
+                        pausedDraggedBody.vy = 0.0;
+                        pausedDraggedBody.angularVelocity = 0.0;
+                        selectedBody = pausedDraggedBody;
+                    }
+                } else {
+                    if (forceBody != null) {
+                        forceCurrent = e.getPoint();
+                    }
+                }
                 repaint();
             }
         });
@@ -89,29 +160,86 @@ public class SimulationPanel extends JPanel {
 
     private void gameLoop() {
         long now = System.nanoTime();
-        double dt = (now - lastTime) / 1_000_000_000.0;
+        double frameTime = (now - lastTime) / 1_000_000_000.0;
         lastTime = now;
-
-        dt = Math.min(dt, 0.025);
+        frameTime = Math.min(frameTime, 0.05);
 
         if (!paused) {
-            updatePhysics(dt);
+            accumulator += frameTime;
+            while (accumulator >= FIXED_DT) {
+                stepSimulation(FIXED_DT);
+                accumulator -= FIXED_DT;
+            }
         }
 
         repaint();
     }
 
+    private void stepSimulation(double dt) {
+        double subDt = dt / SUBSTEPS;
+        for (int s = 0; s < SUBSTEPS; s++) {
+            for (Body body : bodies) {
+                integrateForces(body, subDt);
+            }
+
+            List<Contact> contacts = new ArrayList<>();
+            for (int i = 0; i < bodies.size(); i++) {
+                for (int j = i + 1; j < bodies.size(); j++) {
+                    Contact contact = createContact(bodies.get(i), bodies.get(j));
+                    if (contact != null) {
+                        contacts.add(contact);
+                    }
+                }
+            }
+
+            for (int i = 0; i < SOLVER_ITERATIONS; i++) {
+                for (Contact contact : contacts) {
+                    applyImpulse(contact);
+                }
+            }
+
+            for (Body body : bodies) {
+                integrateVelocity(body, subDt);
+                handleWallCollision(body);
+            }
+
+            for (Contact contact : contacts) {
+                positionalCorrection(contact);
+            }
+        }
+    }
+
+    private void integrateForces(Body body, double dt) {
+        body.ax = 0.0;
+        body.ay = GRAVITY;
+
+        body.vx += body.ax * dt;
+        body.vy += body.ay * dt;
+
+        body.vx *= LINEAR_DAMPING;
+        body.vy *= LINEAR_DAMPING;
+        body.angularVelocity *= ANGULAR_DAMPING;
+    }
+
+    private void integrateVelocity(Body body, double dt) {
+        body.x += body.vx * dt;
+        body.y += body.vy * dt;
+        body.angle += body.angularVelocity * dt;
+    }
+
     private void resetSimulation() {
         bodies.clear();
         selectedBody = null;
+        pausedDraggedBody = null;
+        clearForceState();
 
         int width = Math.max(getWidth(), 1000);
         int height = Math.max(getHeight(), 700);
 
         for (int i = 0; i < INITIAL_BODIES; i++) {
             SpawnMode mode = (i % 2 == 0) ? SpawnMode.CIRCLE : SpawnMode.BOX;
-            double x = 100 + random.nextDouble() * Math.max(1, width - 200);
-            double y = 50 + random.nextDouble() * Math.max(1, height / 2.0 - 100);
+            double x = 120 + random.nextDouble() * Math.max(1, width - 240);
+            double y = 60 + random.nextDouble() * Math.max(1, height / 2.0 - 120);
             spawnBody(x, y, mode);
         }
     }
@@ -121,10 +249,12 @@ public class SimulationPanel extends JPanel {
         body.shape = mode;
         body.x = x;
         body.y = y;
-        body.vx = -220 + random.nextDouble() * 440;
-        body.vy = -180 - random.nextDouble() * 160;
-        body.ax = 0;
+        body.vx = -140 + random.nextDouble() * 280;
+        body.vy = -110 - random.nextDouble() * 110;
+        body.ax = 0.0;
         body.ay = GRAVITY;
+        body.angle = random.nextDouble() * Math.PI * 2.0;
+        body.angularVelocity = -1.8 + random.nextDouble() * 3.6;
         body.color = new Color(
             70 + random.nextInt(160),
             70 + random.nextInt(160),
@@ -132,173 +262,340 @@ public class SimulationPanel extends JPanel {
         );
 
         if (mode == SpawnMode.CIRCLE) {
-            body.radius = 12 + random.nextDouble() * 20;
+            body.radius = 14 + random.nextDouble() * 20;
             body.width = body.radius * 2.0;
             body.height = body.radius * 2.0;
-            body.mass = Math.PI * body.radius * body.radius * 0.020;
+            body.mass = Math.PI * body.radius * body.radius * 0.026;
+            body.inertia = 0.5 * body.mass * body.radius * body.radius;
         } else {
-            body.width = 24 + random.nextDouble() * 28;
-            body.height = 24 + random.nextDouble() * 28;
-            body.radius = Math.max(body.width, body.height) * 0.5;
-            body.mass = body.width * body.height * 0.016;
+            body.width = 26 + random.nextDouble() * 30;
+            body.height = 26 + random.nextDouble() * 30;
+            body.radius = Math.hypot(body.width * 0.5, body.height * 0.5);
+            body.mass = body.width * body.height * 0.018;
+            body.inertia = body.mass * (body.width * body.width + body.height * body.height) / 12.0;
         }
+
+        body.invMass = body.mass > 0.0 ? 1.0 / body.mass : 0.0;
+        body.invInertia = body.inertia > 0.0 ? 1.0 / body.inertia : 0.0;
 
         bodies.add(body);
     }
 
-    private void updatePhysics(double dt) {
-        for (Body body : bodies) {
-            body.ax = 0;
-            body.ay = GRAVITY;
+    private void applyDragForce(Body body, Point start, Point end) {
+        double fx = (start.x - end.x) * FORCE_SCALE;
+        double fy = (start.y - end.y) * FORCE_SCALE;
+        double contactX = start.x;
+        double contactY = start.y;
+        applyImpulseAtPoint(body, fx, fy, contactX, contactY);
+    }
 
-            body.vx += body.ax * dt;
-            body.vy += body.ay * dt;
+    private void applyImpulseAtPoint(Body body, double impulseX, double impulseY, double pointX, double pointY) {
+        body.vx += impulseX * body.invMass;
+        body.vy += impulseY * body.invMass;
 
-            body.vx *= AIR_DRAG;
-            body.vy *= AIR_DRAG;
+        double rx = pointX - body.x;
+        double ry = pointY - body.y;
+        double torqueImpulse = cross(rx, ry, impulseX, impulseY);
+        body.angularVelocity += torqueImpulse * body.invInertia;
+    }
 
-            body.x += body.vx * dt;
-            body.y += body.vy * dt;
-
-            handleWallCollision(body);
-        }
-
-        for (int i = 0; i < bodies.size(); i++) {
-            for (int j = i + 1; j < bodies.size(); j++) {
-                resolveCollision(bodies.get(i), bodies.get(j));
-            }
-        }
+    private void clearForceState() {
+        forceBody = null;
+        forceStart = null;
+        forceCurrent = null;
     }
 
     private void handleWallCollision(Body body) {
-        if (body.getLeft() < 0) {
-            body.x = body.halfWidth();
-            body.vx = -body.vx * RESTITUTION;
-        } else if (body.getRight() > getWidth()) {
-            body.x = getWidth() - body.halfWidth();
-            body.vx = -body.vx * RESTITUTION;
+        double minX = Double.POSITIVE_INFINITY;
+        double maxX = Double.NEGATIVE_INFINITY;
+        double minY = Double.POSITIVE_INFINITY;
+        double maxY = Double.NEGATIVE_INFINITY;
+
+        for (Vec2 v : body.getWorldVertices()) {
+            minX = Math.min(minX, v.x);
+            maxX = Math.max(maxX, v.x);
+            minY = Math.min(minY, v.y);
+            maxY = Math.max(maxY, v.y);
         }
 
-        if (body.getTop() < 0) {
-            body.y = body.halfHeight();
-            body.vy = -body.vy * RESTITUTION;
-        } else if (body.getBottom() > getHeight()) {
-            body.y = getHeight() - body.halfHeight();
-            body.vy = -body.vy * RESTITUTION;
-            body.vx *= WALL_FRICTION;
-
-            if (Math.abs(body.vy) < 12.0) {
+        if (minX < 0.0) {
+            body.x += -minX;
+            body.vx = Math.abs(body.vx) * WALL_RESTITUTION;
+            body.angularVelocity *= 0.92;
+        }
+        if (maxX > getWidth()) {
+            body.x -= (maxX - getWidth());
+            body.vx = -Math.abs(body.vx) * WALL_RESTITUTION;
+            body.angularVelocity *= 0.92;
+        }
+        if (minY < 0.0) {
+            body.y += -minY;
+            body.vy = Math.abs(body.vy) * WALL_RESTITUTION;
+            body.angularVelocity *= 0.92;
+        }
+        if (maxY > getHeight()) {
+            body.y -= (maxY - getHeight());
+            body.vy = -Math.abs(body.vy) * WALL_RESTITUTION;
+            body.vx *= 0.965;
+            body.angularVelocity *= 0.95;
+            if (Math.abs(body.vy) < 9.0) {
                 body.vy = 0.0;
             }
         }
     }
 
-    private void resolveCollision(Body a, Body b) {
+    private Contact createContact(Body a, Body b) {
         if (a.shape == SpawnMode.CIRCLE && b.shape == SpawnMode.CIRCLE) {
-            resolveCircleCircle(a, b);
-        } else {
-            resolveAABBCollision(a, b);
+            return circleCircleContact(a, b);
         }
+        if (a.shape == SpawnMode.BOX && b.shape == SpawnMode.BOX) {
+            return boxBoxContact(a, b);
+        }
+        if (a.shape == SpawnMode.BOX && b.shape == SpawnMode.CIRCLE) {
+            return boxCircleContact(a, b);
+        }
+        Contact c = boxCircleContact(b, a);
+        if (c == null) {
+            return null;
+        }
+        return new Contact(a, b, -c.normalX, -c.normalY, c.penetration, c.contactX, c.contactY);
     }
 
-    private void resolveCircleCircle(Body a, Body b) {
+    private Contact circleCircleContact(Body a, Body b) {
         double dx = b.x - a.x;
         double dy = b.y - a.y;
-        double distanceSquared = dx * dx + dy * dy;
-        double minDistance = a.radius + b.radius;
+        double distSq = dx * dx + dy * dy;
+        double r = a.radius + b.radius;
 
-        if (distanceSquared == 0) {
-            dx = 0.01;
-            dy = 0.01;
-            distanceSquared = dx * dx + dy * dy;
+        if (distSq >= r * r) {
+            return null;
         }
 
-        if (distanceSquared > minDistance * minDistance) {
-            return;
-        }
-
-        double distance = Math.sqrt(distanceSquared);
-        double nx = dx / distance;
-        double ny = dy / distance;
-        double overlap = minDistance - distance;
-
-        separateBodies(a, b, nx, ny, overlap);
-        applyImpulse(a, b, nx, ny);
-    }
-
-    private void resolveAABBCollision(Body a, Body b) {
-        double overlapX = Math.min(a.getRight(), b.getRight()) - Math.max(a.getLeft(), b.getLeft());
-        double overlapY = Math.min(a.getBottom(), b.getBottom()) - Math.max(a.getTop(), b.getTop());
-
-        if (overlapX <= 0 || overlapY <= 0) {
-            return;
-        }
-
+        double dist = Math.sqrt(Math.max(distSq, 1e-12));
         double nx;
         double ny;
-        double overlap;
-
-        if (overlapX < overlapY) {
-            overlap = overlapX;
-            nx = (a.x < b.x) ? 1.0 : -1.0;
+        if (dist < 1e-6) {
+            nx = 1.0;
             ny = 0.0;
+            dist = r - 0.001;
         } else {
-            overlap = overlapY;
-            nx = 0.0;
-            ny = (a.y < b.y) ? 1.0 : -1.0;
+            nx = dx / dist;
+            ny = dy / dist;
         }
 
-        separateBodies(a, b, nx, ny, overlap);
-        applyImpulse(a, b, nx, ny);
+        double penetration = r - dist;
+        double contactX = a.x + nx * a.radius;
+        double contactY = a.y + ny * a.radius;
+        return new Contact(a, b, nx, ny, penetration, contactX, contactY);
     }
 
-    private void separateBodies(Body a, Body b, double nx, double ny, double overlap) {
-        double totalMass = a.mass + b.mass;
-        if (totalMass <= 0) {
+    private Contact boxCircleContact(Body box, Body circle) {
+        double cos = Math.cos(-box.angle);
+        double sin = Math.sin(-box.angle);
+
+        double relX = circle.x - box.x;
+        double relY = circle.y - box.y;
+        double localX = relX * cos - relY * sin;
+        double localY = relX * sin + relY * cos;
+
+        double halfW = box.width * 0.5;
+        double halfH = box.height * 0.5;
+
+        double closestX = clamp(localX, -halfW, halfW);
+        double closestY = clamp(localY, -halfH, halfH);
+
+        double deltaX = localX - closestX;
+        double deltaY = localY - closestY;
+        double distSq = deltaX * deltaX + deltaY * deltaY;
+
+        if (distSq > circle.radius * circle.radius) {
+            return null;
+        }
+
+        double localNormalX;
+        double localNormalY;
+        double penetration;
+        double contactLocalX = closestX;
+        double contactLocalY = closestY;
+
+        if (distSq > 1e-10) {
+            double dist = Math.sqrt(distSq);
+            localNormalX = deltaX / dist;
+            localNormalY = deltaY / dist;
+            penetration = circle.radius - dist;
+        } else {
+            double dxLeft = Math.abs(localX + halfW);
+            double dxRight = Math.abs(halfW - localX);
+            double dyTop = Math.abs(localY + halfH);
+            double dyBottom = Math.abs(halfH - localY);
+            double min = dxLeft;
+            localNormalX = -1.0;
+            localNormalY = 0.0;
+            contactLocalX = -halfW;
+            contactLocalY = localY;
+
+            if (dxRight < min) {
+                min = dxRight;
+                localNormalX = 1.0;
+                localNormalY = 0.0;
+                contactLocalX = halfW;
+                contactLocalY = localY;
+            }
+            if (dyTop < min) {
+                min = dyTop;
+                localNormalX = 0.0;
+                localNormalY = -1.0;
+                contactLocalX = localX;
+                contactLocalY = -halfH;
+            }
+            if (dyBottom < min) {
+                min = dyBottom;
+                localNormalX = 0.0;
+                localNormalY = 1.0;
+                contactLocalX = localX;
+                contactLocalY = halfH;
+            }
+            penetration = circle.radius + min;
+        }
+
+        double worldNormalX = localNormalX * Math.cos(box.angle) - localNormalY * Math.sin(box.angle);
+        double worldNormalY = localNormalX * Math.sin(box.angle) + localNormalY * Math.cos(box.angle);
+        double contactX = box.x + contactLocalX * Math.cos(box.angle) - contactLocalY * Math.sin(box.angle);
+        double contactY = box.y + contactLocalX * Math.sin(box.angle) + contactLocalY * Math.cos(box.angle);
+
+        return new Contact(box, circle, worldNormalX, worldNormalY, penetration, contactX, contactY);
+    }
+
+    private Contact boxBoxContact(Body a, Body b) {
+        Vec2[] axes = new Vec2[4];
+        Vec2[] aAxes = a.getAxes();
+        Vec2[] bAxes = b.getAxes();
+        axes[0] = aAxes[0];
+        axes[1] = aAxes[1];
+        axes[2] = bAxes[0];
+        axes[3] = bAxes[1];
+
+        double smallestOverlap = Double.POSITIVE_INFINITY;
+        Vec2 smallestAxis = null;
+
+        Vec2[] aVerts = a.getWorldVertices();
+        Vec2[] bVerts = b.getWorldVertices();
+
+        for (Vec2 axis : axes) {
+            double[] projA = projectVertices(aVerts, axis);
+            double[] projB = projectVertices(bVerts, axis);
+            double overlap = Math.min(projA[1], projB[1]) - Math.max(projA[0], projB[0]);
+            if (overlap <= 0.0) {
+                return null;
+            }
+            if (overlap < smallestOverlap) {
+                smallestOverlap = overlap;
+                smallestAxis = axis;
+            }
+        }
+
+        if (smallestAxis == null) {
+            return null;
+        }
+
+        double dirX = b.x - a.x;
+        double dirY = b.y - a.y;
+        if (dot(dirX, dirY, smallestAxis.x, smallestAxis.y) < 0.0) {
+            smallestAxis = new Vec2(-smallestAxis.x, -smallestAxis.y);
+        }
+
+        double contactX = (a.x + b.x) * 0.5;
+        double contactY = (a.y + b.y) * 0.5;
+        return new Contact(a, b, smallestAxis.x, smallestAxis.y, smallestOverlap, contactX, contactY);
+    }
+
+    private void applyImpulse(Contact contact) {
+        Body a = contact.a;
+        Body b = contact.b;
+
+        double rxA = contact.contactX - a.x;
+        double ryA = contact.contactY - a.y;
+        double rxB = contact.contactX - b.x;
+        double ryB = contact.contactY - b.y;
+
+        double velAX = a.vx + (-a.angularVelocity * ryA);
+        double velAY = a.vy + (a.angularVelocity * rxA);
+        double velBX = b.vx + (-b.angularVelocity * ryB);
+        double velBY = b.vy + (b.angularVelocity * rxB);
+
+        double rvx = velBX - velAX;
+        double rvy = velBY - velAY;
+
+        double velAlongNormal = rvx * contact.normalX + rvy * contact.normalY;
+        if (velAlongNormal > 0.0) {
             return;
         }
 
-        double correction = overlap + 0.01;
-        a.x -= nx * correction * (b.mass / totalMass);
-        a.y -= ny * correction * (b.mass / totalMass);
-        b.x += nx * correction * (a.mass / totalMass);
-        b.y += ny * correction * (a.mass / totalMass);
-    }
-
-    private void applyImpulse(Body a, Body b, double nx, double ny) {
-        double rvx = b.vx - a.vx;
-        double rvy = b.vy - a.vy;
-        double velocityAlongNormal = rvx * nx + rvy * ny;
-
-        if (velocityAlongNormal > 0) {
+        double raCrossN = cross(rxA, ryA, contact.normalX, contact.normalY);
+        double rbCrossN = cross(rxB, ryB, contact.normalX, contact.normalY);
+        double invMassSum = a.invMass + b.invMass + (raCrossN * raCrossN) * a.invInertia + (rbCrossN * rbCrossN) * b.invInertia;
+        if (invMassSum <= 0.0) {
             return;
         }
 
-        double impulseMagnitude = -(1.0 + RESTITUTION) * velocityAlongNormal;
-        impulseMagnitude /= (1.0 / a.mass) + (1.0 / b.mass);
+        double normalImpulseMag = -(1.0 + RESTITUTION) * velAlongNormal / invMassSum;
+        double impulseX = normalImpulseMag * contact.normalX;
+        double impulseY = normalImpulseMag * contact.normalY;
 
-        double impulseX = impulseMagnitude * nx;
-        double impulseY = impulseMagnitude * ny;
+        a.vx -= impulseX * a.invMass;
+        a.vy -= impulseY * a.invMass;
+        a.angularVelocity -= cross(rxA, ryA, impulseX, impulseY) * a.invInertia;
 
-        a.vx -= impulseX / a.mass;
-        a.vy -= impulseY / a.mass;
-        b.vx += impulseX / b.mass;
-        b.vy += impulseY / b.mass;
+        b.vx += impulseX * b.invMass;
+        b.vy += impulseY * b.invMass;
+        b.angularVelocity += cross(rxB, ryB, impulseX, impulseY) * b.invInertia;
 
-        double tx = -ny;
-        double ty = nx;
-        double tangentVelocity = rvx * tx + rvy * ty;
-        double frictionImpulseMagnitude = -tangentVelocity;
-        frictionImpulseMagnitude /= (1.0 / a.mass) + (1.0 / b.mass);
-        frictionImpulseMagnitude *= 0.06;
+        double tangentX = rvx - velAlongNormal * contact.normalX;
+        double tangentY = rvy - velAlongNormal * contact.normalY;
+        double tangentLength = Math.hypot(tangentX, tangentY);
+        if (tangentLength < 1e-8) {
+            return;
+        }
+        tangentX /= tangentLength;
+        tangentY /= tangentLength;
 
-        double frictionX = frictionImpulseMagnitude * tx;
-        double frictionY = frictionImpulseMagnitude * ty;
+        double raCrossT = cross(rxA, ryA, tangentX, tangentY);
+        double rbCrossT = cross(rxB, ryB, tangentX, tangentY);
+        double tangentMassSum = a.invMass + b.invMass + (raCrossT * raCrossT) * a.invInertia + (rbCrossT * rbCrossT) * b.invInertia;
+        if (tangentMassSum <= 0.0) {
+            return;
+        }
 
-        a.vx -= frictionX / a.mass;
-        a.vy -= frictionY / a.mass;
-        b.vx += frictionX / b.mass;
-        b.vy += frictionY / b.mass;
+        double jt = -(rvx * tangentX + rvy * tangentY) / tangentMassSum;
+        double maxFriction = normalImpulseMag * FRICTION;
+        jt = clamp(jt, -maxFriction, maxFriction);
+
+        double frictionX = jt * tangentX;
+        double frictionY = jt * tangentY;
+
+        a.vx -= frictionX * a.invMass;
+        a.vy -= frictionY * a.invMass;
+        a.angularVelocity -= cross(rxA, ryA, frictionX, frictionY) * a.invInertia;
+
+        b.vx += frictionX * b.invMass;
+        b.vy += frictionY * b.invMass;
+        b.angularVelocity += cross(rxB, ryB, frictionX, frictionY) * b.invInertia;
+    }
+
+    private void positionalCorrection(Contact contact) {
+        double invMassSum = contact.a.invMass + contact.b.invMass;
+        if (invMassSum <= 0.0) {
+            return;
+        }
+
+        double correctionMag = Math.max(contact.penetration - POSITION_SLOP, 0.0) / invMassSum * POSITION_PERCENT;
+        double correctionX = correctionMag * contact.normalX;
+        double correctionY = correctionMag * contact.normalY;
+
+        contact.a.x -= correctionX * contact.a.invMass;
+        contact.a.y -= correctionY * contact.a.invMass;
+        contact.b.x += correctionX * contact.b.invMass;
+        contact.b.y += correctionY * contact.b.invMass;
     }
 
     private Body findBodyAt(Point point) {
@@ -320,6 +617,7 @@ public class SimulationPanel extends JPanel {
         drawBackground(g2);
         drawBodies(g2);
         drawDebugOverlays(g2);
+        drawForcePreview(g2);
 
         if (showHUD) {
             drawHUD(g2);
@@ -350,23 +648,33 @@ public class SimulationPanel extends JPanel {
     private void drawBodies(Graphics2D g2) {
         for (Body body : bodies) {
             if (body == selectedBody && paused) {
-                g2.setColor(new Color(255, 255, 255, 40));
-                g2.fillRect((int) Math.round(body.getLeft() - 6), (int) Math.round(body.getTop() - 6), (int) Math.round(body.width + 12), (int) Math.round(body.height + 12));
+                g2.setColor(new Color(255, 255, 255, 35));
+                g2.fillRect((int) Math.round(body.getAABBMinX() - 8), (int) Math.round(body.getAABBMinY() - 8), (int) Math.round(body.getAABBMaxX() - body.getAABBMinX() + 16), (int) Math.round(body.getAABBMaxY() - body.getAABBMinY() + 16));
             }
 
             g2.setColor(body.color);
             if (body.shape == SpawnMode.CIRCLE) {
-                g2.fillOval((int) Math.round(body.getLeft()), (int) Math.round(body.getTop()), (int) Math.round(body.width), (int) Math.round(body.height));
+                int left = (int) Math.round(body.x - body.radius);
+                int top = (int) Math.round(body.y - body.radius);
+                int diameter = (int) Math.round(body.radius * 2.0);
+                g2.fillOval(left, top, diameter, diameter);
                 g2.setColor(new Color(255, 255, 255, 90));
-                g2.fillOval((int) Math.round(body.getLeft() + body.width * 0.2), (int) Math.round(body.getTop() + body.height * 0.2), Math.max(4, (int) Math.round(body.width * 0.22)), Math.max(4, (int) Math.round(body.height * 0.22)));
+                g2.fillOval((int) Math.round(body.x - body.radius * 0.35), (int) Math.round(body.y - body.radius * 0.5), Math.max(4, (int) Math.round(body.radius * 0.5)), Math.max(4, (int) Math.round(body.radius * 0.5)));
                 g2.setColor(Color.BLACK);
-                g2.drawOval((int) Math.round(body.getLeft()), (int) Math.round(body.getTop()), (int) Math.round(body.width), (int) Math.round(body.height));
+                g2.drawOval(left, top, diameter, diameter);
+                g2.drawLine((int) Math.round(body.x), (int) Math.round(body.y), (int) Math.round(body.x + Math.cos(body.angle) * body.radius), (int) Math.round(body.y + Math.sin(body.angle) * body.radius));
             } else {
-                g2.fillRect((int) Math.round(body.getLeft()), (int) Math.round(body.getTop()), (int) Math.round(body.width), (int) Math.round(body.height));
-                g2.setColor(new Color(255, 255, 255, 70));
-                g2.fillRect((int) Math.round(body.getLeft() + 4), (int) Math.round(body.getTop() + 4), Math.max(4, (int) Math.round(body.width * 0.28)), Math.max(4, (int) Math.round(body.height * 0.28)));
+                Vec2[] vertices = body.getWorldVertices();
+                Path2D.Double path = new Path2D.Double();
+                path.moveTo(vertices[0].x, vertices[0].y);
+                for (int i = 1; i < vertices.length; i++) {
+                    path.lineTo(vertices[i].x, vertices[i].y);
+                }
+                path.closePath();
+                g2.fill(path);
                 g2.setColor(Color.BLACK);
-                g2.drawRect((int) Math.round(body.getLeft()), (int) Math.round(body.getTop()), (int) Math.round(body.width), (int) Math.round(body.height));
+                g2.draw(path);
+                g2.drawLine((int) Math.round(body.x), (int) Math.round(body.y), (int) Math.round(body.x + Math.cos(body.angle) * body.width * 0.5), (int) Math.round(body.y + Math.sin(body.angle) * body.width * 0.5));
             }
         }
     }
@@ -375,17 +683,24 @@ public class SimulationPanel extends JPanel {
         for (Body body : bodies) {
             if (showAABBs) {
                 g2.setColor(new Color(255, 80, 80, 180));
-                g2.drawRect((int) Math.round(body.getLeft()), (int) Math.round(body.getTop()), (int) Math.round(body.width), (int) Math.round(body.height));
+                g2.drawRect((int) Math.round(body.getAABBMinX()), (int) Math.round(body.getAABBMinY()), (int) Math.round(body.getAABBMaxX() - body.getAABBMinX()), (int) Math.round(body.getAABBMaxY() - body.getAABBMinY()));
             }
 
             if (showVelocityVectors) {
-                drawVector(g2, body.x, body.y, body.vx * 0.18, body.vy * 0.18, new Color(80, 220, 255));
+                drawVector(g2, body.x, body.y, body.vx * 0.20, body.vy * 0.20, new Color(80, 220, 255));
             }
 
             if (showAccelerationVectors) {
                 drawVector(g2, body.x, body.y, body.ax * 0.05, body.ay * 0.05, new Color(255, 210, 80));
             }
         }
+    }
+
+    private void drawForcePreview(Graphics2D g2) {
+        if (forceBody == null || forceStart == null || forceCurrent == null || paused) {
+            return;
+        }
+        drawVector(g2, forceStart.x, forceStart.y, forceStart.x - forceCurrent.x, forceStart.y - forceCurrent.y, new Color(150, 255, 150));
     }
 
     private void drawVector(Graphics2D g2, double x, double y, double dx, double dy, Color color) {
@@ -412,15 +727,16 @@ public class SimulationPanel extends JPanel {
     private void drawHUD(Graphics2D g2) {
         g2.setFont(new Font("Monospaced", Font.PLAIN, 14));
         g2.setColor(new Color(0, 0, 0, 150));
-        g2.fillRoundRect(12, 12, 690, 142, 16, 16);
+        g2.fillRoundRect(12, 12, 860, 160, 16, 16);
 
         g2.setColor(Color.WHITE);
         g2.drawString("Advanced 2D Physics Simulator", 24, 34);
         g2.drawString("Bodies: " + bodies.size() + " | Status: " + (paused ? "PAUSED" : "RUNNING") + " | Spawn: " + currentSpawnMode.label, 24, 56);
-        g2.drawString("Running click = spawn selected shape | Paused click = inspect body", 24, 78);
-        g2.drawString("1 = circle | 2 = box | B = spawn center | V = velocity | A = acceleration | X = AABB", 24, 100);
-        g2.drawString("Space = pause | R = reset | C = clear | H = hide HUD", 24, 122);
-        g2.drawString("Selection only works while paused. That part is on purpose, not a bug.", 24, 144);
+        g2.drawString("1 = circle | 2 = box | B = spawn center | V = velocity | A = acceleration | X = AABB", 24, 78);
+        g2.drawString("Space = pause | R = reset | C = clear | H = hide HUD", 24, 100);
+        g2.drawString("Paused: click and drag a body to reposition it, click to inspect it", 24, 122);
+        g2.drawString("Running: click empty space to spawn, click-drag on a body to apply force and torque", 24, 144);
+        g2.drawString("Fixed timestep, substeps, angular impulse, box-circle collision, and less jittery stacking are now in.", 24, 166);
     }
 
     private void drawSelectedBodyPanel(Graphics2D g2, Body body) {
@@ -454,57 +770,51 @@ public class SimulationPanel extends JPanel {
         g2.drawString(String.format("Kinetic Energy: %.2f", kineticEnergy), x + 14, lineY); lineY += step;
         g2.drawString(String.format("Potential Energy: %.2f", potentialEnergy), x + 14, lineY); lineY += step;
         g2.drawString(String.format("Total Energy: %.2f", totalEnergy), x + 14, lineY); lineY += step;
-        g2.drawString(String.format("AABB: [%.1f, %.1f] to [%.1f, %.1f]", body.getLeft(), body.getTop(), body.getRight(), body.getBottom()), x + 14, lineY);
+        g2.drawString(String.format("AABB: [%.1f, %.1f] to [%.1f, %.1f]", body.getAABBMinX(), body.getAABBMinY(), body.getAABBMaxX(), body.getAABBMaxY()), x + 14, lineY);
+    }
+
+    private static double clamp(double val, double min, double max) {
+        return Math.max(min, Math.min(max, val));
+    }
+    private static double dot(double ax, double ay, double bx, double by) {
+        return ax * bx + ay * by;
+    }
+    private static double cross(double ax, double ay, double bx, double by) {
+        return ax * by - ay * bx;
+    }
+    private static double[] projectVertices(Vec2[] verts, Vec2 axis) {
+        double min = dot(verts[0].x, verts[0].y, axis.x, axis.y);
+        double max = min;
+        for (int i = 1; i < verts.length; i++) {
+            double p = dot(verts[i].x, verts[i].y, axis.x, axis.y);
+            min = Math.min(min, p);
+            max = Math.max(max, p);
+        }
+        return new double[]{min, max};
     }
 
     private enum SpawnMode {
         CIRCLE("Circle"),
         BOX("Box");
-
         final String label;
+        SpawnMode(String label) { this.label = label; }
+    }
 
-        SpawnMode(String label) {
-            this.label = label;
-        }
+    private static class Vec2 {
+        final double x, y;
+        Vec2(double x, double y) { this.x = x; this.y = y; }
     }
 
     private static class Body {
         SpawnMode shape;
-        double x;
-        double y;
-        double vx;
-        double vy;
-        double ax;
-        double ay;
-        double width;
-        double height;
-        double radius;
-        double mass;
+        double x, y;
+        double vx, vy;
+        double ax, ay;
+        double angle, angularVelocity;
+        double width, height, radius;
+        double mass, inertia;
+        double invMass, invInertia;
         Color color;
-
-        double halfWidth() {
-            return width * 0.5;
-        }
-
-        double halfHeight() {
-            return height * 0.5;
-        }
-
-        double getLeft() {
-            return x - halfWidth();
-        }
-
-        double getRight() {
-            return x + halfWidth();
-        }
-
-        double getTop() {
-            return y - halfHeight();
-        }
-
-        double getBottom() {
-            return y + halfHeight();
-        }
 
         boolean contains(double px, double py) {
             if (shape == SpawnMode.CIRCLE) {
@@ -512,7 +822,75 @@ public class SimulationPanel extends JPanel {
                 double dy = py - y;
                 return dx * dx + dy * dy <= radius * radius;
             }
-            return px >= getLeft() && px <= getRight() && py >= getTop() && py <= getBottom();
+            // Box: transform point into local box coordinates
+            double cos = Math.cos(-angle);
+            double sin = Math.sin(-angle);
+            double relX = px - x;
+            double relY = py - y;
+            double localX = relX * cos - relY * sin;
+            double localY = relX * sin + relY * cos;
+            return Math.abs(localX) <= width * 0.5 && Math.abs(localY) <= height * 0.5;
+        }
+
+        Vec2[] getWorldVertices() {
+            double cos = Math.cos(angle);
+            double sin = Math.sin(angle);
+            double hw = width * 0.5;
+            double hh = height * 0.5;
+            Vec2[] verts = new Vec2[4];
+            verts[0] = new Vec2(x + (-hw) * cos - (-hh) * sin, y + (-hw) * sin + (-hh) * cos);
+            verts[1] = new Vec2(x + (hw) * cos - (-hh) * sin, y + (hw) * sin + (-hh) * cos);
+            verts[2] = new Vec2(x + (hw) * cos - (hh) * sin, y + (hw) * sin + (hh) * cos);
+            verts[3] = new Vec2(x + (-hw) * cos - (hh) * sin, y + (-hw) * sin + (hh) * cos);
+            return verts;
+        }
+        Vec2[] getAxes() {
+            Vec2[] verts = getWorldVertices();
+            Vec2[] axes = new Vec2[2];
+            axes[0] = new Vec2(verts[1].x - verts[0].x, verts[1].y - verts[0].y);
+            axes[1] = new Vec2(verts[3].x - verts[0].x, verts[3].y - verts[0].y);
+            double len0 = Math.hypot(axes[0].x, axes[0].y);
+            double len1 = Math.hypot(axes[1].x, axes[1].y);
+            axes[0] = new Vec2(axes[0].x / len0, axes[0].y / len0);
+            axes[1] = new Vec2(axes[1].x / len1, axes[1].y / len1);
+            return axes;
+        }
+        double getAABBMinX() {
+            Vec2[] verts = getWorldVertices();
+            double min = verts[0].x;
+            for (int i = 1; i < verts.length; i++) min = Math.min(min, verts[i].x);
+            return min;
+        }
+        double getAABBMaxX() {
+            Vec2[] verts = getWorldVertices();
+            double max = verts[0].x;
+            for (int i = 1; i < verts.length; i++) max = Math.max(max, verts[i].x);
+            return max;
+        }
+        double getAABBMinY() {
+            Vec2[] verts = getWorldVertices();
+            double min = verts[0].y;
+            for (int i = 1; i < verts.length; i++) min = Math.min(min, verts[i].y);
+            return min;
+        }
+        double getAABBMaxY() {
+            Vec2[] verts = getWorldVertices();
+            double max = verts[0].y;
+            for (int i = 1; i < verts.length; i++) max = Math.max(max, verts[i].y);
+            return max;
+        }
+    }
+
+    private static class Contact {
+        final Body a, b;
+        final double normalX, normalY;
+        final double penetration;
+        final double contactX, contactY;
+        Contact(Body a, Body b, double nx, double ny, double penetration, double cx, double cy) {
+            this.a = a; this.b = b;
+            this.normalX = nx; this.normalY = ny;
+            this.penetration = penetration;
+            this.contactX = cx; this.contactY = cy;
         }
     }
 }
