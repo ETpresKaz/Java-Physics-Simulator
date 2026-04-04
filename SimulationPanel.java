@@ -20,10 +20,10 @@ import javax.swing.Timer;
 public class SimulationPanel extends JPanel {
     private static final double GRAVITY = 900.0;
     private static final double LINEAR_DAMPING = 0.999;
-    private static final double ANGULAR_DAMPING = 0.999;
-    private static final double RESTITUTION = 0.18;
-    private static final double FRICTION = 0.55;
-    private static final double WALL_RESTITUTION = 0.16;
+    private static final double ANGULAR_DAMPING = 0.996;
+    private static final double RESTITUTION = 0.10;
+    private static final double FRICTION = 0.72;
+    private static final double WALL_RESTITUTION = 0.10;
     private static final double POSITION_SLOP = 0.01;
     private static final double POSITION_PERCENT = 0.85;
     private static final int TARGET_FPS = 60;
@@ -32,6 +32,10 @@ public class SimulationPanel extends JPanel {
     private static final int SOLVER_ITERATIONS = 8;
     private static final int INITIAL_BODIES = 14;
     private static final double FORCE_SCALE = 7.0;
+    private static final double SLEEP_LINEAR_SPEED = 14.0;
+    private static final double SLEEP_ANGULAR_SPEED = 0.22;
+    private static final double FLOOR_ANGULAR_DAMPING = 0.88;
+    private static final double FLOOR_LINEAR_DAMPING = 0.94;
 
     private final List<Body> bodies = new ArrayList<>();
     private final Random random = new Random();
@@ -203,8 +207,10 @@ public class SimulationPanel extends JPanel {
                 handleWallCollision(body);
             }
 
-            for (Contact contact : contacts) {
-                positionalCorrection(contact);
+            for (int i = 0; i < SOLVER_ITERATIONS; i++) {
+                for (Contact contact : contacts) {
+                    positionalCorrection(contact);
+                }
             }
         }
     }
@@ -232,6 +238,7 @@ public class SimulationPanel extends JPanel {
         selectedBody = null;
         pausedDraggedBody = null;
         clearForceState();
+        accumulator = 0.0;
 
         int width = Math.max(getWidth(), 1000);
         int height = Math.max(getHeight(), 700);
@@ -265,13 +272,13 @@ public class SimulationPanel extends JPanel {
             body.radius = 14 + random.nextDouble() * 20;
             body.width = body.radius * 2.0;
             body.height = body.radius * 2.0;
-            body.mass = Math.PI * body.radius * body.radius * 0.026;
+            body.mass = Math.PI * body.radius * body.radius * 0.008;
             body.inertia = 0.5 * body.mass * body.radius * body.radius;
         } else {
             body.width = 26 + random.nextDouble() * 30;
             body.height = 26 + random.nextDouble() * 30;
             body.radius = Math.hypot(body.width * 0.5, body.height * 0.5);
-            body.mass = body.width * body.height * 0.018;
+            body.mass = body.width * body.height * 0.006;
             body.inertia = body.mass * (body.width * body.width + body.height * body.height) / 12.0;
         }
 
@@ -310,7 +317,7 @@ public class SimulationPanel extends JPanel {
         double maxX = Double.NEGATIVE_INFINITY;
         double minY = Double.POSITIVE_INFINITY;
         double maxY = Double.NEGATIVE_INFINITY;
-
+    
         for (Vec2 v : body.getWorldVertices()) {
             minX = Math.min(minX, v.x);
             maxX = Math.max(maxX, v.x);
@@ -336,13 +343,24 @@ public class SimulationPanel extends JPanel {
         if (maxY > getHeight()) {
             body.y -= (maxY - getHeight());
             body.vy = -Math.abs(body.vy) * WALL_RESTITUTION;
-            body.vx *= 0.965;
-            body.angularVelocity *= 0.95;
-            if (Math.abs(body.vy) < 9.0) {
+            body.vx *= FLOOR_LINEAR_DAMPING;
+            body.angularVelocity *= FLOOR_ANGULAR_DAMPING;
+
+            double linearSpeed = Math.hypot(body.vx, body.vy);
+            double angularSpeed = Math.abs(body.angularVelocity);
+
+            if (linearSpeed < SLEEP_LINEAR_SPEED) {
+                body.vx = 0.0;
+            }
+            if (Math.abs(body.vy) < 10.0) {
                 body.vy = 0.0;
+            }
+            if (angularSpeed < SLEEP_ANGULAR_SPEED) {
+                body.angularVelocity = 0.0;
             }
         }
     }
+    
 
     private Contact createContact(Body a, Body b) {
         if (a.shape == SpawnMode.CIRCLE && b.shape == SpawnMode.CIRCLE) {
@@ -354,11 +372,14 @@ public class SimulationPanel extends JPanel {
         if (a.shape == SpawnMode.BOX && b.shape == SpawnMode.CIRCLE) {
             return boxCircleContact(a, b);
         }
-        Contact c = boxCircleContact(b, a);
-        if (c == null) {
-            return null;
+        if (a.shape == SpawnMode.CIRCLE && b.shape == SpawnMode.BOX) {
+            Contact c = boxCircleContact(b, a);
+            if (c == null) {
+                return null;
+            }
+            return new Contact(a, b, -c.normalX, -c.normalY, c.penetration, c.contactX, c.contactY);
         }
-        return new Contact(a, b, -c.normalX, -c.normalY, c.penetration, c.contactX, c.contactY);
+        return null;
     }
 
     private Contact circleCircleContact(Body a, Body b) {
@@ -428,6 +449,7 @@ public class SimulationPanel extends JPanel {
             double dxRight = Math.abs(halfW - localX);
             double dyTop = Math.abs(localY + halfH);
             double dyBottom = Math.abs(halfH - localY);
+
             double min = dxLeft;
             localNormalX = -1.0;
             localNormalY = 0.0;
@@ -455,13 +477,16 @@ public class SimulationPanel extends JPanel {
                 contactLocalX = localX;
                 contactLocalY = halfH;
             }
+
             penetration = circle.radius + min;
         }
 
-        double worldNormalX = localNormalX * Math.cos(box.angle) - localNormalY * Math.sin(box.angle);
-        double worldNormalY = localNormalX * Math.sin(box.angle) + localNormalY * Math.cos(box.angle);
-        double contactX = box.x + contactLocalX * Math.cos(box.angle) - contactLocalY * Math.sin(box.angle);
-        double contactY = box.y + contactLocalX * Math.sin(box.angle) + contactLocalY * Math.cos(box.angle);
+        double boxCos = Math.cos(box.angle);
+        double boxSin = Math.sin(box.angle);
+        double worldNormalX = localNormalX * boxCos - localNormalY * boxSin;
+        double worldNormalY = localNormalX * boxSin + localNormalY * boxCos;
+        double contactX = box.x + contactLocalX * boxCos - contactLocalY * boxSin;
+        double contactY = box.y + contactLocalX * boxSin + contactLocalY * boxCos;
 
         return new Contact(box, circle, worldNormalX, worldNormalY, penetration, contactX, contactY);
     }
@@ -504,8 +529,8 @@ public class SimulationPanel extends JPanel {
             smallestAxis = new Vec2(-smallestAxis.x, -smallestAxis.y);
         }
 
-        double contactX = (a.x + b.x) * 0.5;
-        double contactY = (a.y + b.y) * 0.5;
+        double contactX = (clamp(a.x, b.getAABBMinX(), b.getAABBMaxX()) + clamp(b.x, a.getAABBMinX(), a.getAABBMaxX())) * 0.5;
+        double contactY = (clamp(a.y, b.getAABBMinY(), b.getAABBMaxY()) + clamp(b.y, a.getAABBMinY(), a.getAABBMaxY())) * 0.5;
         return new Contact(a, b, smallestAxis.x, smallestAxis.y, smallestOverlap, contactX, contactY);
     }
 
@@ -567,7 +592,7 @@ public class SimulationPanel extends JPanel {
         }
 
         double jt = -(rvx * tangentX + rvy * tangentY) / tangentMassSum;
-        double maxFriction = normalImpulseMag * FRICTION;
+        double maxFriction = Math.max(normalImpulseMag * FRICTION, 0.0);
         jt = clamp(jt, -maxFriction, maxFriction);
 
         double frictionX = jt * tangentX;
@@ -596,7 +621,35 @@ public class SimulationPanel extends JPanel {
         contact.a.y -= correctionY * contact.a.invMass;
         contact.b.x += correctionX * contact.b.invMass;
         contact.b.y += correctionY * contact.b.invMass;
+
+        double normalDot = Math.abs(contact.normalY);
+        if (normalDot > 0.65) {
+            settleBody(contact.a);
+            settleBody(contact.b);
+        }
     }
+
+    private void settleBody(Body body) {
+        double linearSpeed = Math.hypot(body.vx, body.vy);
+        double angularSpeed = Math.abs(body.angularVelocity);
+
+        if (linearSpeed < SLEEP_LINEAR_SPEED) {
+            body.vx *= 0.6;
+            if (Math.abs(body.vx) < 1.0) {
+                body.vx = 0.0;
+            }
+            if (Math.abs(body.vy) < 10.0) {
+                body.vy = 0.0;
+            }
+        }
+
+        if (angularSpeed < SLEEP_ANGULAR_SPEED) {
+            body.angularVelocity = 0.0;
+        } else if (angularSpeed < SLEEP_ANGULAR_SPEED * 4.0) {
+            body.angularVelocity *= 0.82;
+        }
+    }
+
 
     private Body findBodyAt(Point point) {
         for (int i = bodies.size() - 1; i >= 0; i--) {
@@ -663,6 +716,7 @@ public class SimulationPanel extends JPanel {
                 g2.setColor(Color.BLACK);
                 g2.drawOval(left, top, diameter, diameter);
                 g2.drawLine((int) Math.round(body.x), (int) Math.round(body.y), (int) Math.round(body.x + Math.cos(body.angle) * body.radius), (int) Math.round(body.y + Math.sin(body.angle) * body.radius));
+                g2.drawLine((int) Math.round(body.x), (int) Math.round(body.y), (int) Math.round(body.x + Math.cos(body.angle + Math.PI * 0.5) * body.radius * 0.5), (int) Math.round(body.y + Math.sin(body.angle + Math.PI * 0.5) * body.radius * 0.5));
             } else {
                 Vec2[] vertices = body.getWorldVertices();
                 Path2D.Double path = new Path2D.Double();
@@ -727,27 +781,30 @@ public class SimulationPanel extends JPanel {
     private void drawHUD(Graphics2D g2) {
         g2.setFont(new Font("Monospaced", Font.PLAIN, 14));
         g2.setColor(new Color(0, 0, 0, 150));
-        g2.fillRoundRect(12, 12, 860, 160, 16, 16);
+        g2.fillRoundRect(12, 12, 920, 170, 16, 16);
 
         g2.setColor(Color.WHITE);
         g2.drawString("Advanced 2D Physics Simulator", 24, 34);
         g2.drawString("Bodies: " + bodies.size() + " | Status: " + (paused ? "PAUSED" : "RUNNING") + " | Spawn: " + currentSpawnMode.label, 24, 56);
         g2.drawString("1 = circle | 2 = box | B = spawn center | V = velocity | A = acceleration | X = AABB", 24, 78);
         g2.drawString("Space = pause | R = reset | C = clear | H = hide HUD", 24, 100);
-        g2.drawString("Paused: click and drag a body to reposition it, click to inspect it", 24, 122);
-        g2.drawString("Running: click empty space to spawn, click-drag on a body to apply force and torque", 24, 144);
-        g2.drawString("Fixed timestep, substeps, angular impulse, box-circle collision, and less jittery stacking are now in.", 24, 166);
+        g2.drawString("Physics: fixed dt=" + FIXED_DT + " | substeps=" + SUBSTEPS + " | solver iterations=" + SOLVER_ITERATIONS, 24, 118);
+        g2.drawString("Paused: click-drag a body to reposition it, click it to inspect values with units", 24, 136);
+        g2.drawString("Running: click empty space to spawn, click-drag on a body to apply impulse and torque", 24, 154);
+        g2.drawString("Rotation settles harder at rest, masses are lighter, and the pause panel now shows units.", 24, 172);
     }
 
     private void drawSelectedBodyPanel(Graphics2D g2, Body body) {
         double speedSquared = body.vx * body.vx + body.vy * body.vy;
         double speed = Math.sqrt(speedSquared);
-        double kineticEnergy = 0.5 * body.mass * speedSquared;
-        double potentialEnergy = body.mass * GRAVITY * Math.max(0, getHeight() - body.y);
+        double translationalKE = 0.5 * body.mass * speedSquared;
+        double rotationalKE = 0.5 * body.inertia * body.angularVelocity * body.angularVelocity;
+        double kineticEnergy = translationalKE + rotationalKE;
+        double potentialEnergy = body.mass * GRAVITY * Math.max(0.0, getHeight() - body.y);
         double totalEnergy = kineticEnergy + potentialEnergy;
 
-        int panelWidth = 360;
-        int panelHeight = 248;
+        int panelWidth = 460;
+        int panelHeight = 380;
         int x = getWidth() - panelWidth - 16;
         int y = 16;
 
@@ -760,17 +817,23 @@ public class SimulationPanel extends JPanel {
         int step = 18;
         g2.drawString("Selected Body", x + 14, lineY); lineY += step;
         g2.drawString("Shape: " + body.shape.label, x + 14, lineY); lineY += step;
-        g2.drawString(String.format("Position: (%.2f, %.2f)", body.x, body.y), x + 14, lineY); lineY += step;
-        g2.drawString(String.format("Velocity: (%.2f, %.2f)", body.vx, body.vy), x + 14, lineY); lineY += step;
-        g2.drawString(String.format("Acceleration: (%.2f, %.2f)", body.ax, body.ay), x + 14, lineY); lineY += step;
-        g2.drawString(String.format("Speed: %.2f", speed), x + 14, lineY); lineY += step;
-        g2.drawString(String.format("Mass: %.3f", body.mass), x + 14, lineY); lineY += step;
-        g2.drawString(String.format("Width: %.2f | Height: %.2f", body.width, body.height), x + 14, lineY); lineY += step;
-        g2.drawString(String.format("Radius: %.2f", body.radius), x + 14, lineY); lineY += step;
-        g2.drawString(String.format("Kinetic Energy: %.2f", kineticEnergy), x + 14, lineY); lineY += step;
-        g2.drawString(String.format("Potential Energy: %.2f", potentialEnergy), x + 14, lineY); lineY += step;
-        g2.drawString(String.format("Total Energy: %.2f", totalEnergy), x + 14, lineY); lineY += step;
-        g2.drawString(String.format("AABB: [%.1f, %.1f] to [%.1f, %.1f]", body.getAABBMinX(), body.getAABBMinY(), body.getAABBMaxX(), body.getAABBMaxY()), x + 14, lineY);
+        g2.drawString(String.format("Position: (%.2f px, %.2f px)", body.x, body.y), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Velocity: (%.2f px/s, %.2f px/s)", body.vx, body.vy), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Acceleration: (%.2f px/s^2, %.2f px/s^2)", body.ax, body.ay), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Speed: %.2f px/s", speed), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Angle: %.2f rad | %.2f deg", body.angle, Math.toDegrees(body.angle)), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Angular Velocity: %.2f rad/s | %.2f deg/s", body.angularVelocity, Math.toDegrees(body.angularVelocity)), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Mass: %.4f sim-mass units", body.mass), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Inertia: %.4f sim-inertia units", body.inertia), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Inverse Mass: %.6f 1/sim-mass", body.invMass), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Inverse Inertia: %.6f 1/sim-inertia", body.invInertia), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Width: %.2f px | Height: %.2f px | Radius: %.2f px", body.width, body.height, body.radius), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Translational KE: %.2f energy units", translationalKE), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Rotational KE: %.2f energy units", rotationalKE), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Total KE: %.2f energy units", kineticEnergy), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Potential Energy: %.2f energy units", potentialEnergy), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("Total Energy: %.2f energy units", totalEnergy), x + 14, lineY); lineY += step;
+        g2.drawString(String.format("AABB: [%.1f px, %.1f px] to [%.1f px, %.1f px]", body.getAABBMinX(), body.getAABBMinY(), body.getAABBMaxX(), body.getAABBMaxY()), x + 14, lineY);
     }
 
     private static double clamp(double val, double min, double max) {
@@ -833,6 +896,15 @@ public class SimulationPanel extends JPanel {
         }
 
         Vec2[] getWorldVertices() {
+            if (shape == SpawnMode.CIRCLE) {
+                return new Vec2[] {
+                    new Vec2(x - radius, y - radius),
+                    new Vec2(x + radius, y - radius),
+                    new Vec2(x + radius, y + radius),
+                    new Vec2(x - radius, y + radius)
+                };
+            }
+
             double cos = Math.cos(angle);
             double sin = Math.sin(angle);
             double hw = width * 0.5;
@@ -845,15 +917,12 @@ public class SimulationPanel extends JPanel {
             return verts;
         }
         Vec2[] getAxes() {
-            Vec2[] verts = getWorldVertices();
-            Vec2[] axes = new Vec2[2];
-            axes[0] = new Vec2(verts[1].x - verts[0].x, verts[1].y - verts[0].y);
-            axes[1] = new Vec2(verts[3].x - verts[0].x, verts[3].y - verts[0].y);
-            double len0 = Math.hypot(axes[0].x, axes[0].y);
-            double len1 = Math.hypot(axes[1].x, axes[1].y);
-            axes[0] = new Vec2(axes[0].x / len0, axes[0].y / len0);
-            axes[1] = new Vec2(axes[1].x / len1, axes[1].y / len1);
-            return axes;
+            double cos = Math.cos(angle);
+            double sin = Math.sin(angle);
+            return new Vec2[] {
+                new Vec2(cos, sin),
+                new Vec2(-sin, cos)
+            };
         }
         double getAABBMinX() {
             Vec2[] verts = getWorldVertices();
